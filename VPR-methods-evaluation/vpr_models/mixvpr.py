@@ -93,7 +93,6 @@ class MixVPR(nn.Module):
 ### Implement ResNet-50 here for MixVPR model,
 ### otherwise `self.backbone = ResNet()` will fail
 ### (academic purpose)
-
 class ResNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -114,7 +113,6 @@ class ResNet(nn.Module):
         x = self.model.layer2(x)
         x = self.model.layer3(x)
         return x
-
 
 class MixVPRModel(torch.nn.Module):
     def __init__(self, agg_config={}):
