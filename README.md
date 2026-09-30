@@ -1,304 +1,122 @@
-# **Visual Place Recognition – Extension 6.1: Adaptive Re-ranking**
+# Visual Place Recognition with Adaptive Re-ranking
 
-This repository extends a Visual Place Recognition (VPR) pipeline with **Extension 6.1: adaptive re-ranking**.
+Visual place recognition (VPR) estimates where a photo was taken by retrieving the most similar geo-tagged images from a database. A standard pipeline has two stages:
 
-## **Summary**
+1. **Global retrieval** ranks the database with a single descriptor per image. It takes 0.01–0.25 s per query.
+2. **Geometric re-ranking** matches local features between the query and each of the top-20 candidates, runs RANSAC, and re-orders the candidates by inlier count. It is often more accurate, but it costs about 1–5 s per query.
 
-Baseline VPR produces a **top-K retrieval list** (we use **K \= 20**). A strong but expensive improvement is to run a local feature matcher (LoFTR or SuperPoint \+ LightGlue) between the query and **all top-20** candidates, then **rerank** by geometric consistency (number of inliers). This typically improves Recall@k but is computationally heavy.
+This project **benchmarks both stages** and then adds **adaptive re-ranking**: a logistic-regression gate that pays for re-ranking **only on queries it predicts to be hard**.
 
-**Adaptive re-ranking** reduces compute by performing full top-20 matching **only for hard queries**:
+> Team project (4 students), *Advanced Machine Learning*, Politecnico di Torino, 2025.
+> Full report: [`s337035_s350812_s339063_s350958_project4.pdf`](s337035_s350812_s339063_s350958_project4.pdf)
 
-1. Always match **top-1** candidate → obtain inliers\_top1  
-2. Logistic Regression (LR) predicts P(top1\_correct) from inliers\_top1  
-3. If P(top1\_correct) \>= threshold: **EASY** → stop (keep retrieval order)  
-4. Else: **HARD** → match remaining candidates up to K and rerank by inliers
+## Key results: adaptive re-ranking
 
-We report:
+MixVPR retrieval + SuperPoint+LightGlue re-ranking, top-K = 20, a prediction counts as correct within 25 m (Recall@1, %):
 
-* Baseline Recall@{1,5,10,20} (retrieval-only)  
-* Adaptive Recall@{1,5,10,20} (gated re-ranking)  
-* Compute proxies: hard\_rate, savings\_vs\_fullrerank
+| Test set | Retrieval only | Full re-ranking (always on) | **Adaptive re-ranking** | Share of full gain kept | Matcher calls saved |
+|---|---|---|---|---|---|
+| SVOX Night (823 queries) | 62.6 | 81.3 | **80.9** | 98% | 59% |
+| Tokyo-XS (315 queries) | 76.5 | 89.2 | **88.3** | 93% | 71% |
 
-## **Methods used**
+- **Matcher calls saved** = 1 − (average number of matched candidates per query) / 20. An easy query costs 1 match and a hard query costs 20.
+- **Where the numbers come from.** The retrieval-only and full re-ranking columns come from the benchmark runs (report, Table 1). The adaptive column comes from [`results/`](results). The adaptive runs recompute their own retrieval-only baseline, which differs slightly on SVOX Night (62.3 vs 62.6).
+- **More configurations.** Results for CosPlace, LoFTR, SVOX Sun and SF-XS are in the report (Table 3) and in `results/`.
 
-**VPR backbones (retrieval):**
+## Benchmark findings
 
-* MixVPR  
-* CosPlace
+The benchmark covers 4 retrieval models (NetVLAD, CosPlace, MixVPR, MegaLoc) × 3 local matchers (LoFTR, SuperPoint+LightGlue, SuperGlue) on SF-XS, Tokyo-XS and SVOX Sun/Night:
 
-**Image matching methods (geometric verification):**
+- **Re-ranking helps most when retrieval has headroom.** This happens when the correct place is in the top 20 but not ranked first. The largest gain is CosPlace on SVOX Night: 33.3 → 61.2 Recall@1 with LoFTR.
+- **It adds little on top of strong retrieval, and can even hurt.** MegaLoc already reaches 96.5 Recall@1 on SVOX Night, and re-ranking lowers it (91.1 with SuperPoint+LightGlue) when matching fails.
+- **Cost is dominated by matching.** SuperGlue took about 1–1.5 s per query, while LoFTR and SuperPoint+LightGlue were usually slower, at up to about 5 s. Timings are indicative only, because runs were spread across different machines and Colab GPUs.
+- **Dot product and L2 distance give identical rankings,** as expected with L2-normalized descriptors.
 
-* LoFTR  
-* SuperPoint + LightGlue
+## Adaptive re-ranking: method
 
-**Adaptive gate:**
-
-* Logistic Regression with a single feature: inliers\_top1
-
-## **Files added for the extension**
-
-We added **three scripts**:
-
-1. build\_csv.py  
-   Builds per-query CSV datasets from retrieval outputs \+ matcher outputs.  
-2. tune\_lr\_and\_threshold.py  
-   Trains LR models and tunes LR regularization C and probability thresholds on validation.  
-3. adaptive\_match\_and\_eval.py  
-   Runs runtime adaptive matching and evaluation (baseline \+ adaptive Recall@k \+ compute proxies).
-
-## **Constants (used everywhere)**
-
-* K \= 20  
-* Positive distance threshold \= **25m**
-
-These must be consistent across CSV building, LR tuning, and evaluation.
-
-# **0\) Setup**
-
-## **0.1 Install dependencies (Colab / Linux)**
-
-From repository root:
-```bash
-pip -q install pandas numpy tqdm scikit-learn==1.5.2 joblib opencv-python kornia einops
 ```
-*Note: Torch is typically preinstalled in Colab. If not, install torch for your runtime CUDA version.*
-
-## **0.2 Go to repo root**
-```bash
-cd /content/drive/MyDrive/VPR\_Project/Visual-Place-Recognition-Project
+query ──► global retrieval (MixVPR or CosPlace) ──► top-20 candidates
+                                                     │
+                 match the query with the top-1 candidate only (LoFTR or SuperPoint+LightGlue + RANSAC)
+                                                     │
+                   logistic regression on the top-1 inlier count ──► P(top-1 is correct)
+                                                     │
+                   P ≥ τ  ──►  EASY: keep the retrieval order (1 match)
+                   P < τ  ──►  HARD: match all 20 candidates and re-rank by inlier count
 ```
-# **1\) Inputs required from previous parts**
 
-Before running the extension, you must already have:
+- **Signal.** The only input is the number of RANSAC inliers between the query and its top-1 candidate. On the SF-XS validation set, this single number predicts whether the top-1 retrieval is correct with ROC-AUC 0.95.
+- **Two domain-specific gates.**
+  - LR-Sun is trained on the SVOX **train** queries under daylight (712 queries), and LR-Night on the SVOX train queries at night (702 queries).
+  - Each gate pools 4 pipelines (MixVPR/CosPlace × LoFTR/SuperPoint+LightGlue).
+- **Model selection on validation data only (SF-XS val, 7,993 queries).**
+  - The regularization strength C maximizes validation ROC-AUC.
+  - The threshold τ maximizes validation accuracy at predicting top-1 correctness, with ties broken by savings. This gives τ_Sun = 0.15 and τ_Night = 0.25.
+  - The test sets (Tokyo-XS, SVOX Sun/Night test, SF-XS test) are used only for the final evaluation.
+- **Equivalent inlier threshold.** Because the gate has one input, it amounts to a threshold on the inlier count. A query is treated as easy when its top-1 match has at least **14 inliers (LR-Sun)** or **16 inliers (LR-Night)**. The logistic regression provides the calibrated probability used to choose that cut-off.
 
-* Retrieval prediction files: .../preds/\*.txt (one per query)  
-* Matcher outputs for building CSVs:  
-  * .../preds\_loftr/\*.torch  
-  * .../preds\_superpoint-lg/\*.torch
+## Repository structure
 
-*Note: adaptive\_match\_and\_eval.py does not require precomputed matcher outputs (it runs matching on demand), but CSV building does require .torch outputs.*
+**Written by our team:**
 
-# **2\) Build CSVs (Training \+ Validation)**
+| Path | Purpose |
+|---|---|
+| `build_csv.py` | Builds per-query tables (`inliers_top1`, `baseline_correct`, `reranked_correct`) from retrieval and matcher outputs |
+| `tune_lr_and_threshold.py` | Trains the gate, selects C and τ on validation data, and writes the threshold sweep |
+| `adaptive_match_and_eval.py` | Runs adaptive matching on a test set and reports retrieval-only and adaptive Recall@{1,5,10,20}, hard-query rate and savings |
+| `Project_AML.ipynb` | Colab notebook with the runs from one of our environments: part of the benchmark, gate training and all adaptive evaluations. Other benchmark runs were executed by team members on their own machines |
+| `csv/`, `models/`, `sweeps/`, `results/` | Gate training/validation tables, the trained gates (`lr_sun`, `lr_night`), C and τ sweeps, and per-run summaries with per-query decisions (`results/` also holds runs at τ = 0.45 and 0.85) |
+| `VPR-methods-evaluation/vpr_models/mixvpr.py`, `netvlad.py` | Small changes: a ResNet-50 backbone for MixVPR, and a NetVLAD checkpoint download without `wget` |
 
-We build CSVs that contain only the required columns for LR and threshold tuning.
+**From the course starter code** ([FarInHeight/Visual-Place-Recognition-Project](https://github.com/FarInHeight/Visual-Place-Recognition-Project), MIT):
+`VPR-methods-evaluation/`, `match_queries_preds.py`, `reranking.py`, `vpr_uncertainty/`, `util.py`, `download_datasets.py`, `start_your_project.ipynb`.
+Local matchers come from [alexstoken/image-matching-models](https://github.com/alexstoken/image-matching-models).
 
-## **2.1 Column schema**
+## Reproducing
 
-* **Training CSVs (minimal):** query\_id, inliers\_top1, baseline\_correct  
-* **Validation CSVs (for threshold tuning):** query\_id, inliers\_top1, baseline\_correct, reranked\_correct
-
-## **2.2 Build TRAIN CSVs (Sun and Night)**
-
-You must produce 8 training CSV files:
-
-* 4 pipelines for Sun (MixVPR/CosPlace × LoFTR/SuperPoint-LG)  
-* 4 pipelines for Night (MixVPR/CosPlace × LoFTR/SuperPoint-LG)
-
-**Example command (Sun, MixVPR × LoFTR):**
 ```bash
-python build_csv.py \
-  --preds-dir "logs/<RUN_SUN_MIXVPR>/preds" \
-  --inliers-dir "logs/<RUN_SUN_MIXVPR>/preds_loftr" \
-  --out-csv "csv/train/train_sun_mixvpr_loftr.csv" \
-  --num-preds 20 \
-  --positive-dist-threshold 25
+git clone https://github.com/dariush-vaghei/vpr-adaptive-reranking.git
+cd vpr-adaptive-reranking
+
+# local matchers (the version used by the course starter code)
+git clone https://github.com/alexstoken/image-matching-models.git
+cd image-matching-models && git checkout 0079bf7 && git submodule update --init --recursive && pip install -e .[all] && cd ..
+
+pip install faiss-cpu pandas numpy tqdm scikit-learn==1.5.2 joblib opencv-python kornia einops
+python download_datasets.py
 ```
-**Example command (Sun, MixVPR × SuperPoint-LG):**
-```bash
-python build_csv.py \
-  --preds-dir "logs/<RUN_SUN_MIXVPR>/preds" \
-  --inliers-dir "logs/<RUN_SUN_MIXVPR>/preds_superpoint-lg" \
-  --out-csv "csv/train/train_sun_mixvpr_superpoint-lg.csv" \
-  --num-preds 20 \
-  --positive-dist-threshold 25
-```
-Repeat analogously for:
 
-* CosPlace × LoFTR  
-* CosPlace × SuperPoint-LG
+1. **Retrieval.** This saves the top-20 predictions for each query:
+   ```bash
+   python VPR-methods-evaluation/main.py --method mixvpr --backbone ResNet50 --descriptors_dimension 4096 \
+     --image_size 512 512 --database_folder <db> --queries_folder <queries> \
+     --num_preds_to_save 20 --recall_values 1 5 10 20 --log_dir logs/<run>
+   ```
+2. **Always-on re-ranking** (needed for the gate's training and validation tables):
+   ```bash
+   python match_queries_preds.py --preds-dir <run>/preds --matcher superpoint-lg --num-preds 20
+   python reranking.py --preds-dir <run>/preds --inliers-dir <run>/preds_superpoint-lg --num-preds 20
+   ```
+3. **Gate tables** (one per pipeline, for SVOX train Sun/Night and SF-XS val):
+   ```bash
+   python build_csv.py --preds-dir <run>/preds --inliers-dir <run>/preds_superpoint-lg --out-csv csv/train/<name>.csv
+   ```
+4. **Train the gate and select C and τ:**
+   ```bash
+   python tune_lr_and_threshold.py --train-csvs csv/train/train_night_*.csv --val-csvs csv/validation/sf_val_*.csv \
+     --out-model models/lr_night.joblib --out-json models/lr_night.json \
+     --out-table sweeps/night_best_per_C.csv --out-curve sweeps/night_threshold_curve_bestC.csv
+   ```
+5. **Adaptive evaluation on a test set:**
+   ```bash
+   python adaptive_match_and_eval.py --preds-dir <test_run>/preds --out-dir <test_run>/adaptive_sp-lg_lr_night \
+     --matcher superpoint-lg --lr-model models/lr_night.joblib --lr-json models/lr_night.json \
+     --out-json results/svox_night/<name>_summary.json --log-jsonl results/svox_night/<name>_decisions.jsonl
+   ```
+   - `--threshold` overrides τ.
+   - `--data-root` remaps image paths if the predictions were produced on another machine.
+   - Matches are cached in `--out-dir` and reused on reruns.
 
-Repeat again for Night (changing train\_sun\_ to train\_night\_...).
+## License
 
-## **2.3 Build VALIDATION CSVs (SF-XS validation)**
-
-SF-XS validation is not split into Sun/Night. Produce 4 validation CSV files (one per pipeline):
-
-* csv/validation/sf\_val\_mixvpr\_loftr.csv  
-* csv/validation/sf\_val\_mixvpr\_superpoint-lg.csv  
-* csv/validation/sf\_val\_cosplace\_loftr.csv  
-* csv/validation/sf\_val\_cosplace\_superpoint-lg.csv
-
-**Example (SF-XS val, CosPlace × LoFTR):**
-```bash
-python build_csv.py \
-  --preds-dir "logs/<RUN_SFVAL_COSPLACE>/preds" \
-  --inliers-dir "logs/<RUN_SFVAL_COSPLACE>/preds_loftr" \
-  --out-csv "csv/validation/sf_val_cosplace_loftr.csv" \
-  --num-preds 20 \
-  --positive-dist-threshold 25
-```
-# **3\) Train LR models \+ tune thresholds**
-
-We train two LRs:
-
-1. **LR-Sun** trained on pooled Sun train CSVs (4 pipelines)  
-2. **LR-Night** trained on pooled Night train CSVs (4 pipelines)
-
-We tune:
-
-* Logistic regression regularization C  
-* Probability threshold used to gate EASY/HARD
-
-**Outputs:**
-
-* models/lr\_sun.joblib, models/lr\_sun.json  
-* models/lr\_night.joblib, models/lr\_night.json  
-* sweeps/\*.csv tables with sweep results
-
-Create output folders:
-```bash
-mkdir -p models sweeps
-```
-## **3.1 Train \+ tune LR-Sun**
-```bash
-python tune_lr_and_threshold.py \
-  --train-csvs \
-    csv/train/train_sun_mixvpr_loftr.csv \
-    csv/train/train_sun_mixvpr_superpoint-lg.csv \
-    csv/train/train_sun_cosplace_loftr.csv \
-    csv/train/train_sun_cosplace_superpoint-lg.csv \
-  --val-csvs \
-    csv/validation/sf_val_mixvpr_loftr.csv \
-    csv/validation/sf_val_mixvpr_superpoint-lg.csv \
-    csv/validation/sf_val_cosplace_loftr.csv \
-    csv/validation/sf_val_cosplace_superpoint-lg.csv \
-  --out-model models/lr_sun.joblib \
-  --out-json models/lr_sun.json \
-  --out-table sweeps/sun_best_per_C.csv \
-  --C-grid "0.01,0.03,0.1,0.3,1,3,10,30,100" \
-  --thresholds "0.00:1.00:0.01" \
-  --objective "max_r1_then_savings"
-```
-## **3.2 Train \+ tune LR-Night**
-```bash
-python tune_lr_and_threshold.py \
-  --train-csvs \
-    csv/train/train_night_mixvpr_loftr.csv \
-    csv/train/train_night_mixvpr_superpoint-lg.csv \
-    csv/train/train_night_cosplace_loftr.csv \
-    csv/train/train_night_cosplace_superpoint-lg.csv \
-  --val-csvs \
-    csv/validation/sf_val_mixvpr_loftr.csv \
-    csv/validation/sf_val_mixvpr_superpoint-lg.csv \
-    csv/validation/sf_val_cosplace_loftr.csv \
-    csv/validation/sf_val_cosplace_superpoint-lg.csv \
-  --out-model models/lr_night.joblib \
-  --out-json models/lr_night.json \
-  --out-table sweeps/night_best_per_C.csv \
-  --C-grid "0.01,0.03,0.1,0.3,1,3,10,30,100" \
-  --thresholds "0.00:1.00:0.01" \
-  --objective "max_r1_then_savings"
-```
-# **4\) Adaptive matching \+ evaluation on test sets**
-
-This is the "runtime" evaluation:
-
-* Always match top-1  
-* Match top-20 only for HARD queries  
-* Evaluate baseline and adaptive Recall@{1,5,10,20}  
-* Report compute proxies
-
-Create results folders:
-```bash
-mkdir -p results/tokyo results/svox_sun results/svox_night results/sf_xs
-```
-## **4.1 Command template**
-```bash
-python adaptive_match_and_eval.py \
-  --preds-dir "<RUN_TEST>/preds" \
-  --out-dir "<RUN_TEST>/adaptive_<matcher>_<lr>" \
-  --matcher <loftr|superpoint-lg> \
-  --device cuda \
-  --im-size 512 \
-  --num-preds 20 \
-  --lr-model "models/<lr>.joblib" \
-  --lr-json "models/<lr>.json" \
-  --positive-dist-threshold 25 \
-  --recall-values "1,5,10,20" \
-  --data-root "/content/vpr_data" \
-  --log-jsonl "results/<dataset>/<name>_decisions.jsonl" \
-  --out-json "results/<dataset>/<name>_summary.json"
-```
-**Notes:**
-
-* Use a fresh \--out-dir for fair runtime (otherwise cached torch files can be reused).  
-* \--data-root is used to remap image paths inside preds/\*.txt to your dataset location.
-
-## **4.2 Example: Tokyo XS (MixVPR × LoFTR) with LR-Sun**
-```bash
-python adaptive_match_and_eval.py \
-  --preds-dir "logs/tokyo_xs_mixvpr/<RUN>/preds" \
-  --out-dir "logs/tokyo_xs_mixvpr/<RUN>/adaptive_loftr_lr_sun" \
-  --matcher loftr \
-  --device cuda \
-  --im-size 512 \
-  --num-preds 20 \
-  --lr-model "models/lr_sun.joblib" \
-  --lr-json "models/lr_sun.json" \
-  --positive-dist-threshold 25 \
-  --recall-values "1,5,10,20" \
-  --data-root "/content/vpr_data" \
-  --log-jsonl "results/tokyo/mixvpr_loftr_lr_sun_decisions.jsonl" \
-  --out-json "results/tokyo/mixvpr_loftr_lr_sun_summary.json"
-```
-Repeat evaluation across:
-
-* Backbones: MixVPR, CosPlace  
-* Matchers: LoFTR, SuperPoint-LG  
-* LR models: LR-Sun, LR-Night  
-* Test datasets: Tokyo XS, SVOX Sun, SVOX Night, SF-XS (as required)
-
-# **5\) Manual threshold testing (no code changes)**
-
-The evaluation script reads the threshold from models/lr\_\*.json (key: best\_threshold). To test a custom threshold, create a temporary JSON.
-
-**Example: LR-Night with threshold 0.45**
-```bash
-import json
-
-src = "models/lr_night.json"
-dst = "models/lr_night_thr_0p45.json"
-
-with open(src, "r") as f:
-    d = json.load(f)
-
-d["best_threshold"] = 0.45
-
-with open(dst, "w") as f:
-    json.dump(d, f, indent=2)
-
-print("Wrote:", dst)
-```
-Then run adaptive evaluation with:
-```bash
---lr-json "models/lr_night_thr_0p45.json"
-```
-# **6\) Outputs**
-
-**Models**
-
-* models/lr\_sun.joblib  
-* models/lr\_sun.json  
-* models/lr\_night.joblib  
-* models/lr\_night.json
-
-**CSVs**
-
-* csv/train/\*.csv  
-* csv/validation/\*.csv
-
-**Adaptive evaluation results**
-
-* results/\<dataset\>/\*\_summary.json: Contains baseline/adaptive recalls and compute proxies.  
-* results/\<dataset\>/\*\_decisions.jsonl: One JSON record per query: easy/hard decision, probability, matched count, etc.  
-* \<RUN\>/adaptive\_\*/\*.torch: Per-query matcher outputs computed during runtime adaptive evaluation.
+MIT. The starter code and third-party components keep their original licenses.
