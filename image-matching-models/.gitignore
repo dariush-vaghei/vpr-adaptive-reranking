@@ -1,7 +1,0 @@
-.spyproject
-.idea
-__pycache__
-model_weights
-outputs_*
-*.egg-info/*
-build
